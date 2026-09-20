@@ -28,6 +28,7 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
 from vllm_ascend.device.device_op import DeviceOperator
@@ -62,6 +63,66 @@ def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> 
     if token_dispatch_input.quant.use_w4a8_per_channel_gmm_swiglu:
         return EXPERT_TOKEN_NUMS_TYPE_COUNT
     return EXPERT_TOKEN_NUMS_TYPE_CUMSUM
+
+
+# One-time host-side validation of the expert map layout, keyed by the local
+# expert slice and guarded by the storage of the map it was derived from.
+_EXPERT_MAP_LAYOUT_CACHE: dict[tuple[int, int, int], tuple[int, bool]] = {}
+
+
+def _eplb_reorders_expert_map() -> bool:
+    """Whether EPLB may rewrite ``expert_map`` while the engine is running.
+
+    EPLB (a static ``expert_map_path`` or dynamic EPLB) reorders the experts a
+    rank owns, so the layout validation below must not be cached. Keep the
+    generic mask path instead.
+    """
+    try:
+        eplb_config = get_ascend_config().eplb_config
+    except RuntimeError:
+        # Without an Ascend config EPLB cannot be ruled out: stay on the generic
+        # path.
+        return True
+    return bool(eplb_config.dynamic_eplb or eplb_config.expert_map_path is not None)
+
+
+def _expert_map_has_contiguous_local_range(
+    expert_map: torch.Tensor, first_expert_idx: int, last_expert_idx: int
+) -> bool:
+    """Whether ``expert_map`` marks exactly ``[first_expert_idx, last_expert_idx)``.
+
+    The default ("linear") EP placement maps the local experts to one contiguous
+    slice of the global expert space (``expert_map[e] == e - first_expert_idx``)
+    and marks every other expert with -1. For that layout
+    ``expert_map[topk_ids] != -1`` is equivalent to a range comparison, which
+    avoids the aclnnIndex ``Index``/``IndexCheck`` kernels the lookup needs.
+    """
+    if not 0 <= first_expert_idx <= last_expert_idx:
+        return False
+    map_on_host = expert_map.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    if map_on_host.numel() < last_expert_idx:
+        return False
+    expected = torch.full_like(map_on_host, -1)
+    expected[first_expert_idx:last_expert_idx] = torch.arange(last_expert_idx - first_expert_idx, dtype=expected.dtype)
+    return bool(torch.equal(map_on_host, expected))
+
+
+def _is_contiguous_local_range(expert_map: torch.Tensor, first_expert_idx: int, last_expert_idx: int) -> bool:
+    """Cached entry point of the mask fast path (see ``token_dispatch``).
+
+    The layout is a property of the EP rank rather than of a token batch, so it
+    is validated once per ``(first_expert_idx, last_expert_idx, numel)`` and
+    reused. A map backed by other storage re-runs the validation.
+    """
+    if _eplb_reorders_expert_map():
+        return False
+    key = (int(first_expert_idx), int(last_expert_idx), expert_map.numel())
+    cached = _EXPERT_MAP_LAYOUT_CACHE.get(key)
+    if cached is not None and cached[0] == expert_map.data_ptr():
+        return cached[1]
+    contiguous = _expert_map_has_contiguous_local_range(expert_map, first_expert_idx, last_expert_idx)
+    _EXPERT_MAP_LAYOUT_CACHE[key] = (expert_map.data_ptr(), contiguous)
+    return contiguous
 
 
 class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
@@ -391,10 +452,20 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
             global_num_experts = len(expert_map) + global_redundant_expert_num
-            mask = expert_map[topk_ids] != -1
-            topk_weights = topk_weights * mask
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
             last_expert_idx = first_expert_idx + self.num_experts_local
+            if envs.VLLM_ASCEND_MOE_MASK_RANGE and _is_contiguous_local_range(
+                expert_map, first_expert_idx, last_expert_idx
+            ):
+                # The mask is still needed: -1 entries in ``expanded_row_idx``
+                # make unpermute read rows that were never written, and only the
+                # zeroed weights suppress them.
+                topk_weights = topk_weights.masked_fill(
+                    (topk_ids < first_expert_idx) | (topk_ids >= last_expert_idx), 0.0
+                )
+            else:
+                mask = expert_map[topk_ids] != -1
+                topk_weights = topk_weights * mask
         else:
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local

@@ -87,6 +87,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Replace the routed-expert mask lookup (``expert_map[topk_ids] != -1``) with
+    # a range comparison whenever the expert map assigns the local experts to one
+    # contiguous slice of the global expert space, which is the default ("linear")
+    # EP placement. Disabled by default; EPLB always keeps the lookup.
+    "VLLM_ASCEND_MOE_MASK_RANGE": lambda: os.getenv("VLLM_ASCEND_MOE_MASK_RANGE", "0") == "1",
 }
 
 # end-env-vars-definition

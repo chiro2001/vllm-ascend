@@ -15,6 +15,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -40,6 +41,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (  # isort: skip
     TokenDispatcherWithAllGather,
     TokenDispatcherWithMC2,
 )
+from vllm_ascend.ops.fused_moe import token_dispatcher as token_dispatcher_module  # isort: skip
 from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEMxfpParams, MoEQuantParams
 from vllm_ascend.quantization.quant_type import QuantType
 
@@ -836,6 +838,269 @@ class TestTokenDispatcherWithAllGather(TestBase):
         results = self.dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
         self.assertEqual(results.hidden_states.shape, (6, 128))
         self.assertIsInstance(results.combine_metadata, MoEAllGatherCombineMetadata)
+
+
+# DeepSeek-V4.1-style EP8 deployment: 384 routed experts, 48 local experts per
+# rank.  Rank 3 therefore owns the contiguous global slice [144, 192).
+MOE_GLOBAL_EXPERTS = 384
+MOE_EXPERTS_PER_RANK = 48
+MOE_EP_SIZE = MOE_GLOBAL_EXPERTS // MOE_EXPERTS_PER_RANK
+MOE_EP_RANK = 3
+MOE_FIRST_EXPERT_IDX = MOE_EP_RANK * MOE_EXPERTS_PER_RANK
+MOE_LAST_EXPERT_IDX = MOE_FIRST_EXPERT_IDX + MOE_EXPERTS_PER_RANK
+MOE_TOKENS = 8
+MOE_TOP_K = 6
+
+
+def build_linear_expert_map() -> torch.Tensor:
+    """``determine_expert_map`` linear placement: local experts are contiguous."""
+    expert_map = torch.full((MOE_GLOBAL_EXPERTS,), -1, dtype=torch.int32)
+    expert_map[MOE_FIRST_EXPERT_IDX:MOE_LAST_EXPERT_IDX] = torch.arange(MOE_EXPERTS_PER_RANK, dtype=torch.int32)
+    return expert_map
+
+
+def build_eplb_reordered_expert_map() -> torch.Tensor:
+    """EPLB/round-robin placement: the local experts are strided, not contiguous."""
+    expert_map = torch.full((MOE_GLOBAL_EXPERTS,), -1, dtype=torch.int32)
+    local_experts = torch.arange(MOE_EP_RANK, MOE_GLOBAL_EXPERTS, MOE_EP_SIZE)
+    expert_map[local_experts] = torch.arange(local_experts.numel(), dtype=torch.int32)
+    return expert_map
+
+
+def build_mask_range_topk_ids() -> torch.Tensor:
+    """Top-k ids that straddle both edges of the local slice of rank 3."""
+    return torch.tensor(
+        [
+            [0, 41, 143, 144, 191, 192],
+            [145, 191, 47, 383, 96, 190],
+            [144, 145, 146, 147, 148, 149],
+            [0, 1, 2, 3, 4, 5],
+            [190, 191, 192, 193, 194, 195],
+            [143, 144, 191, 192, 0, 383],
+            [300, 301, 302, 303, 304, 305],
+            [48, 96, 144, 192, 240, 288],
+        ],
+        dtype=torch.int32,
+    )
+
+
+class TestTokenDispatcherWithAllGatherMaskRange(TestBase):
+    """``VLLM_ASCEND_MOE_MASK_RANGE`` fast path of ``TokenDispatcherWithAllGather``.
+
+    ``expert_map[topk_ids] != -1`` is replaced by a range comparison when the
+    expert map assigns the local experts to one contiguous slice of the global
+    expert space, which avoids the aclnnIndex ``Index``/``IndexCheck`` kernels.
+    The mask itself must survive: the -1 entries in ``expanded_row_idx`` make
+    unpermute read rows that were never written, and only the zeroed weights
+    suppress them.
+    """
+
+    def setUp(self):
+        self.ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_path=None))
+        ascend_config_patcher = patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_ascend_config",
+            return_value=self.ascend_config,
+        )
+        ascend_config_patcher.start()
+        self.addCleanup(ascend_config_patcher.stop)
+
+        ep_group = MagicMock()
+        ep_group.rank_in_group = MOE_EP_RANK
+        ep_group.world_size = MOE_EP_SIZE
+        ep_group_patcher = patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_ep_group", return_value=ep_group)
+        ep_group_patcher.start()
+        self.addCleanup(ep_group_patcher.stop)
+
+        # Only the device routing kernel is stubbed out; the mask computation
+        # under test runs before it and is asserted on the dispatch output.
+        routing_patcher = patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
+            return_value=(
+                torch.randn(MOE_TOKENS * MOE_TOP_K, 16),
+                torch.arange(MOE_TOKENS * MOE_TOP_K),
+                torch.zeros(MOE_TOKENS * MOE_TOP_K, dtype=torch.int32),
+                None,
+            ),
+        )
+        routing_patcher.start()
+        self.addCleanup(routing_patcher.stop)
+
+        # The layout cache is process-wide; keep tests independent of each other.
+        self.addCleanup(token_dispatcher_module._EXPERT_MAP_LAYOUT_CACHE.clear)
+        token_dispatcher_module._EXPERT_MAP_LAYOUT_CACHE.clear()
+
+        self.dispatcher = TokenDispatcherWithAllGather(
+            top_k=MOE_TOP_K,
+            num_experts=MOE_GLOBAL_EXPERTS,
+            num_local_experts=MOE_EXPERTS_PER_RANK,
+            max_num_tokens=MOE_TOKENS,
+        )
+
+    def masked_topk_weights(self, expert_map, topk_ids, topk_weights, mask_range: bool):
+        """Run ``token_dispatch`` and return the weights of the combine stage."""
+        token_dispatch_input = build_token_dispatch_input_fixture(
+            hidden_states=torch.randn(MOE_TOKENS, 16),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
+        )
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop("VLLM_ASCEND_MOE_MASK_RANGE", None)
+            if mask_range:
+                os.environ["VLLM_ASCEND_MOE_MASK_RANGE"] = "1"
+            output = self.dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+        return output.combine_metadata.topk_weights
+
+    def test_range_compare_matches_expert_map_lookup(self):
+        expert_map = build_linear_expert_map()
+        topk_ids = build_mask_range_topk_ids()
+        topk_weights = torch.rand(MOE_TOKENS, MOE_TOP_K)
+        expected = topk_weights * (expert_map[topk_ids] != -1)
+
+        lookup_weights = self.masked_topk_weights(expert_map, topk_ids, topk_weights, mask_range=False)
+        range_weights = self.masked_topk_weights(expert_map, topk_ids, topk_weights, mask_range=True)
+
+        # both paths reproduce `expert_map[topk_ids] != -1` element by element
+        self.assertTrue(torch.equal(lookup_weights, expected))
+        self.assertTrue(torch.equal(range_weights, expected))
+        # and they are numerically equivalent to each other
+        self.assertTrue(torch.equal(range_weights, lookup_weights))
+        # the mask is still applied: ids outside [144, 192) are zeroed out
+        self.assertGreater(int((range_weights == 0).sum()), 0)
+        self.assertFalse(torch.equal(range_weights, topk_weights))
+        # the contiguous layout was accepted and remembered
+        self.assertIs(
+            token_dispatcher_module._EXPERT_MAP_LAYOUT_CACHE[
+                (MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX, MOE_GLOBAL_EXPERTS)
+            ][1],
+            True,
+        )
+
+    def test_range_compare_is_opt_in(self):
+        expert_map = build_linear_expert_map()
+        with patch("vllm_ascend.ops.fused_moe.token_dispatcher._is_contiguous_local_range") as layout_gate:
+            weights = self.masked_topk_weights(
+                expert_map, build_mask_range_topk_ids(), torch.rand(MOE_TOKENS, MOE_TOP_K), mask_range=False
+            )
+        # the disabled default never validates the layout
+        layout_gate.assert_not_called()
+        self.assertEqual(weights.shape, (MOE_TOKENS, MOE_TOP_K))
+
+    def test_non_contiguous_map_falls_back_to_expert_map_lookup(self):
+        expert_map = build_eplb_reordered_expert_map()
+        topk_ids = build_mask_range_topk_ids()
+        topk_weights = torch.rand(MOE_TOKENS, MOE_TOP_K)
+        lookup_weights = topk_weights * (expert_map[topk_ids] != -1)
+        range_weights = topk_weights.masked_fill(
+            (topk_ids < MOE_FIRST_EXPERT_IDX) | (topk_ids >= MOE_LAST_EXPERT_IDX), 0.0
+        )
+        # the two forms disagree here: e.g. 145 is inside the slice of rank 3 but
+        # belongs to rank 1 under EPLB placement
+        self.assertFalse(torch.equal(lookup_weights, range_weights))
+
+        dispatched = self.masked_topk_weights(expert_map, topk_ids, topk_weights, mask_range=True)
+
+        self.assertTrue(torch.equal(dispatched, lookup_weights))
+        self.assertIs(
+            token_dispatcher_module._EXPERT_MAP_LAYOUT_CACHE[
+                (MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX, MOE_GLOBAL_EXPERTS)
+            ][1],
+            False,
+        )
+
+    def test_dynamic_eplb_falls_back_to_expert_map_lookup(self):
+        self.ascend_config.eplb_config.dynamic_eplb = True
+        expert_map = build_linear_expert_map()
+        topk_ids = build_mask_range_topk_ids()
+        topk_weights = torch.rand(MOE_TOKENS, MOE_TOP_K)
+        expected = topk_weights * (expert_map[topk_ids] != -1)
+
+        dispatched = self.masked_topk_weights(expert_map, topk_ids, topk_weights, mask_range=True)
+
+        self.assertTrue(torch.equal(dispatched, expected))
+        # EPLB rewrites the map at runtime, so nothing may be cached
+        self.assertEqual(token_dispatcher_module._EXPERT_MAP_LAYOUT_CACHE, {})
+
+    def test_static_eplb_expert_map_path_falls_back_to_expert_map_lookup(self):
+        self.ascend_config.eplb_config.expert_map_path = "/tmp/eplb_expert_map.json"
+        expert_map = build_linear_expert_map()
+        topk_ids = build_mask_range_topk_ids()
+        topk_weights = torch.rand(MOE_TOKENS, MOE_TOP_K)
+        expected = topk_weights * (expert_map[topk_ids] != -1)
+
+        dispatched = self.masked_topk_weights(expert_map, topk_ids, topk_weights, mask_range=True)
+
+        self.assertTrue(torch.equal(dispatched, expected))
+        self.assertEqual(token_dispatcher_module._EXPERT_MAP_LAYOUT_CACHE, {})
+
+    def test_layout_validation_is_cached_per_expert_slice(self):
+        expert_map = build_linear_expert_map()
+        validations = []
+        check = token_dispatcher_module._expert_map_has_contiguous_local_range
+
+        def counting_check(map_arg, first_expert_idx, last_expert_idx):
+            validations.append((first_expert_idx, last_expert_idx))
+            return check(map_arg, first_expert_idx, last_expert_idx)
+
+        with patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher._expert_map_has_contiguous_local_range",
+            side_effect=counting_check,
+        ):
+            # the layout is a property of the rank, so new token batches must not
+            # re-run the host-side check
+            for _ in range(3):
+                self.masked_topk_weights(
+                    expert_map,
+                    torch.randint(0, MOE_GLOBAL_EXPERTS, (MOE_TOKENS, MOE_TOP_K), dtype=torch.int32),
+                    torch.rand(MOE_TOKENS, MOE_TOP_K),
+                    mask_range=True,
+                )
+
+        # the host-side check runs once and is reused by the following steps
+        self.assertEqual(validations, [(MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX)])
+        self.assertEqual(len(token_dispatcher_module._EXPERT_MAP_LAYOUT_CACHE), 1)
+
+    def test_relaidout_map_invalidates_the_cached_layout(self):
+        expert_map = build_linear_expert_map()
+        self.assertTrue(
+            token_dispatcher_module._is_contiguous_local_range(expert_map, MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX)
+        )
+
+        # a map with the same shape but a different layout must not reuse the
+        # cached answer
+        relaidout = build_eplb_reordered_expert_map()
+        self.assertFalse(
+            token_dispatcher_module._is_contiguous_local_range(relaidout, MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX)
+        )
+        self.assertFalse(
+            token_dispatcher_module._EXPERT_MAP_LAYOUT_CACHE[
+                (MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX, MOE_GLOBAL_EXPERTS)
+            ][1]
+        )
+        # and the original map is re-validated on the next step
+        self.assertTrue(
+            token_dispatcher_module._is_contiguous_local_range(expert_map, MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX)
+        )
+
+    def test_layout_check_requires_the_canonical_linear_placement(self):
+        check = token_dispatcher_module._expert_map_has_contiguous_local_range
+        self.assertTrue(check(build_linear_expert_map(), MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX))
+
+        # contiguous slice, but the local slot numbering is not the linear one
+        relabelled = build_linear_expert_map()
+        relabelled[MOE_FIRST_EXPERT_IDX:MOE_LAST_EXPERT_IDX] = relabelled[
+            MOE_FIRST_EXPERT_IDX:MOE_LAST_EXPERT_IDX
+        ].flip(0)
+        self.assertFalse(check(relabelled, MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX))
+
+        # a single extra expert outside the slice breaks the contiguity
+        stray = build_linear_expert_map()
+        stray[0] = 0
+        self.assertFalse(check(stray, MOE_FIRST_EXPERT_IDX, MOE_LAST_EXPERT_IDX))
+
+        # a slice that does not fit into the map is rejected instead of raising
+        self.assertFalse(check(build_linear_expert_map(), MOE_GLOBAL_EXPERTS, MOE_GLOBAL_EXPERTS + 1))
+        self.assertFalse(check(build_linear_expert_map(), MOE_LAST_EXPERT_IDX, MOE_FIRST_EXPERT_IDX))
 
 
 class TestTokenDispatcherWithAll2AllV(TestBase):
