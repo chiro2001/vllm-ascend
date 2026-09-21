@@ -21,6 +21,42 @@ class RopeGlobalState:
 _ROPE_STATE = RopeGlobalState()
 
 
+def _rope_index_1d(pos_tensor: torch.Tensor) -> torch.Tensor:
+    """Flatten a position tensor to the 1-D index ``index_select`` expects.
+
+    ``reshape`` is a view, and the cast is a no-op for the int64 positions every
+    in-tree caller passes (the attention call sites slice positions and call
+    ``.long()``; the model runner's positions buffer is int64), so the index
+    itself adds no kernel next to the lookup it feeds.
+    """
+    index = pos_tensor.reshape(-1)
+    return index if index.dtype == torch.int64 else index.to(torch.int64)
+
+
+def _rope_gather_rows(
+    src: torch.Tensor,
+    select_idx: torch.Tensor | None,
+    gather_idx: torch.Tensor | None,
+    out: torch.Tensor,
+) -> None:
+    """Write ``src[pos_tensor]`` into the preallocated buffer ``out``.
+
+    ``select_idx`` is the flattened 1-D index for ``torch.index_select`` (one
+    GatherV3 kernel). The caller builds it **once** and hands the same tensor to
+    the cos and the sin lookup: flattening is free, but the cast that int32
+    positions need is a real device op, so building the index per direction
+    would pay a dispatch for nothing.
+
+    ``gather_idx`` is kept for position tensors with more than one dimension,
+    where flattening would change the result shape. Exactly one of the two
+    indices is not ``None``.
+    """
+    if gather_idx is None:
+        torch.index_select(src, 0, select_idx, out=out)
+    else:
+        torch.gather(src, 0, gather_idx, out=out)
+
+
 class RopeDataProxy:
     def __init__(self, data_map, is_cos=True):
         self._data = data_map
@@ -129,22 +165,31 @@ def get_cos_and_sin_dsa(
                 # indexing followed by `copy_`; the change only combines the
                 # indexing and the write into the preallocated output buffers.
                 #
-                # gather_idx is built so torch.gather picks the same rows: each
-                # row contains the token index repeated along the rotary dim.
-                # pos_tensor -> reshape(-1, 1, 1, 1) gives each token its own
-                # row; expand() broadcasts that row across the rotary dim to
-                # match full_rope_* (which is [max_pos, 1, 1, rotary_dim]),
-                # so torch.gather(..., dim=0) selects row pos_tensor[i].
+                # Exactly one of the two indices is built, and either one is
+                # built once for both lookups:
+                #
+                # * 1-D positions -> select_idx, the flat index that
+                #   index_select takes directly. Flattening is a view, so this
+                #   is free for the int64 positions every in-tree caller
+                #   passes, and costs one cast for an int32 source.
+                # * other shapes -> gather_idx, which has to be materialised
+                #   along the rotary dim first: each token index is broadcast
+                #   so that torch.gather(..., dim=0) picks row pos_tensor[i] of
+                #   full_rope_* ([num_positions, 1, 1, rotary_dim]). Flattening
+                #   those would change the result shape.
                 gather_idx = (
-                    pos_tensor.to(torch.long).reshape(-1, 1, 1, 1).expand(num_tokens, 1, 1, full_rope_cos.size(-1))
+                    None
+                    if pos_tensor.dim() == 1
+                    else pos_tensor.to(torch.long).reshape(-1, 1, 1, 1).expand(num_tokens, 1, 1, full_rope_cos.size(-1))
                 )
+                select_idx = None if gather_idx is not None else _rope_index_1d(pos_tensor)
                 if draft_index is None:
                     if output_len > buf_cos.shape[0]:
                         raise ValueError(
                             f"DSA RoPE runtime buffer is too small: capacity={buf_cos.shape[0]}, required={output_len}"
                         )
-                    torch.gather(full_rope_cos, 0, gather_idx, out=buf_cos[:num_tokens])
-                    torch.gather(full_rope_sin, 0, gather_idx, out=buf_sin[:num_tokens])
+                    _rope_gather_rows(full_rope_cos, select_idx, gather_idx, buf_cos[:num_tokens])
+                    _rope_gather_rows(full_rope_sin, select_idx, gather_idx, buf_sin[:num_tokens])
                     if output_len > num_tokens:
                         buf_cos[num_tokens:output_len].fill_(1)
                         buf_sin[num_tokens:output_len].zero_()
@@ -162,17 +207,11 @@ def get_cos_and_sin_dsa(
                             f"capacity={draft_cos.shape[0]}, "
                             f"required={output_len}"
                         )
-                    torch.gather(
-                        full_rope_cos,
-                        0,
-                        gather_idx,
-                        out=draft_cos[:num_tokens],
+                    _rope_gather_rows(
+                        full_rope_cos, select_idx, gather_idx, draft_cos[:num_tokens]
                     )
-                    torch.gather(
-                        full_rope_sin,
-                        0,
-                        gather_idx,
-                        out=draft_sin[:num_tokens],
+                    _rope_gather_rows(
+                        full_rope_sin, select_idx, gather_idx, draft_sin[:num_tokens]
                     )
                     if output_len > num_tokens:
                         draft_cos[num_tokens:output_len].fill_(1)
@@ -182,8 +221,15 @@ def get_cos_and_sin_dsa(
                         draft_sin[:output_len],
                     )
             else:
-                curr_cos = full_rope_cos[pos_tensor]
-                curr_sin = full_rope_sin[pos_tensor]
+                if pos_tensor.dim() == 1:
+                    # Advanced indexing `src[pos]` lowers to Index + IndexCheck;
+                    # index_select is a single GatherV3 with the same values.
+                    select_idx = _rope_index_1d(pos_tensor)
+                    curr_cos = torch.index_select(full_rope_cos, 0, select_idx)
+                    curr_sin = torch.index_select(full_rope_sin, 0, select_idx)
+                else:
+                    curr_cos = full_rope_cos[pos_tensor]
+                    curr_sin = full_rope_sin[pos_tensor]
                 batch_result[config_key][group_name] = (curr_cos, curr_sin)
 
     return RopeDataProxy(batch_result, is_cos=True), RopeDataProxy(batch_result, is_cos=False)
